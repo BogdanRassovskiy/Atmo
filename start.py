@@ -4,7 +4,7 @@ import subprocess
 
 from bot.loader import bot
 
-WEBHOOK_URL = "https://intime-studio.com/webhook/"
+WEBHOOK_URL = "https://intime-studio.com/webhook/atmo/"
 
 async def set_webhook():
     await bot.set_webhook(WEBHOOK_URL)
