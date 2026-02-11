@@ -1,8 +1,10 @@
 from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
 from aiogram.types import Update
 from .loader import bot, dp
 import json
 
+@csrf_exempt
 async def telegram_webhook(request):
     if request.method == "POST":
         data = json.loads(request.body)
