@@ -14,4 +14,14 @@ if __name__ == "__main__":
     asyncio.run(set_webhook())
 
     print("Запуск сервера на порту 4001...")
-    subprocess.run(["python3", "manage.py", "runserver", "0.0.0.0:4001"])
+    subprocess.run([
+    "python3",
+    "-m",
+    "uvicorn",
+    "atmo.asgi:application",
+    "--host",
+    "0.0.0.0",
+    "--port",
+    "4001"
+])
+    
