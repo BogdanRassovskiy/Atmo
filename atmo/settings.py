@@ -25,7 +25,7 @@ SECRET_KEY = '2z1^wfv-&5umkg7m*yhgoul&e5fd*fc479akno-95i7krszz8m'
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ["intime-studio.cz", "www.intime-studio.cz"]
+ALLOWED_HOSTS = ["intime-studio.com", "www.intime-studio.com"]
 
 
 # Application definition
