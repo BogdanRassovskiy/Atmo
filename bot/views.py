@@ -47,7 +47,7 @@ def format_registration_message(registration, user, is_new):
 <b>🕓 Дата регистрации:</b> {registration.created_at.strftime('%d.%m.%Y %H:%M')}
 """
 
-def send_to_telegram(message: str):
+def send_to_telegram(message: str, registration_id: int = None):
     try:
         url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
@@ -55,6 +55,22 @@ def send_to_telegram(message: str):
             "text": message,
             "parse_mode": "HTML"
         }
+        
+        # Добавляем inline кнопки если передан registration_id
+        if registration_id:
+            payload["reply_markup"] = {
+                "inline_keyboard": [[
+                    {
+                        "text": "✅ Оплачено",
+                        "callback_data": f"pay_{registration_id}"
+                    },
+                    {
+                        "text": "❌ Отменить",
+                        "callback_data": f"cancel_{registration_id}"
+                    }
+                ]]
+            }
+        
         res = requests.post(url, json=payload, timeout=5)
         res.raise_for_status()
         return True
@@ -163,12 +179,11 @@ def weblink(request):
         
         # Отправляем уведомление в Telegram
         message = format_registration_message(registration, user, registration_created)
-        send_to_telegram(message)
+        send_to_telegram(message, registration.id)
         
         # Если пользователь новый - отправляем приветственное сообщение
         if user_created:
-            welcome_message = f"""✨ Здравствуйте, {user.first_name} ✨
-             Добро пожаловать на фестиваль трансформационных игр 
+            welcome_message = f"""✨ {user.first_name}, Добро пожаловать на фестиваль трансформационных игр ✨
 
 Благодарим Вас за выбор — выбор расширяться и идти в трансформацию ❤️
 
@@ -181,14 +196,26 @@ def weblink(request):
         if registration_created:  # Только если была создана новая регистрация
             total_registrations = Registration.objects.filter(user=user).count()
             if total_registrations == 4:
-                four_games_message = f"""✨ Здравствуйте, {user.first_name} ✨
-             Вы выбрали 4 трансформационные игр 
+                four_games_message = f"""✨ Регистрация завершена ✨
 
-Благодарим Вас за выбор — выбор расширяться и идти в трансформацию ❤️
+Благодарим за оплату, Ваше участие подтверждено.
 
-Для завершения регистрации необходимо внести 100% оплату участия.
+Ваш регистрационный номер: {registration.id}    
 
-Реквизиты для оплаты: 1234 5678 9012 3456"""
+Игры:
+1 день -  (11:00 - 13:00)
+2 день - (14:30 - 16:30)
+
+
+Обед: 13:00 - 14:30
+
+❗️Необходимо придти к 10:30 
+
+Адрес:
+
+Рады, что Вы с нами в этом пространстве трансформации.
+
+До скорой встречи на фестивале ✨"""
                 send_to_telegram(four_games_message)
         
         return JsonResponse({
