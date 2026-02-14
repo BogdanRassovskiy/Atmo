@@ -1,6 +1,7 @@
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart
+from asgiref.sync import sync_to_async
 import requests
 from django.conf import settings
 import traceback
@@ -26,9 +27,9 @@ async def payment_callback_handler(callback: CallbackQuery):
         registration_id = int(registration_id)
         print(f"Action: {action}, Registration ID: {registration_id}")
         
-        # Получаем регистрацию
+        # Получаем регистрацию (sync_to_async)
         try:
-            registration = Registration.objects.get(id=registration_id)
+            registration = await sync_to_async(Registration.objects.get)(id=registration_id)
             print(f"Registration found: {registration.booking_id}")
         except Registration.DoesNotExist:
             print("Registration not found!")
@@ -60,15 +61,15 @@ async def payment_callback_handler(callback: CallbackQuery):
             status_text = "\n\n<b>❌ Статус: Отменено</b>"
             print("Setting is_paid = False")
         
-        registration.save()
+        await sync_to_async(registration.save)()
         print("Registration saved")
         
-        # Обновляем сообщение
+        # Обновляем сообщение и убираем клавиатуру
         new_text = callback.message.text + status_text
         await callback.message.edit_text(
             text=new_text,
             parse_mode="HTML",
-            reply_markup=callback.message.reply_markup
+            reply_markup=None
         )
         print("Message updated")
         
