@@ -10,7 +10,12 @@ router = Router()
 
 @router.message(CommandStart())
 async def start_handler(message: Message):
-    await message.answer("Бот работает.")
+    await message.answer("Бот работает. Добро пожаловать!")
+
+@router.message()
+async def echo_handler(message: Message):
+    """Обработчик всех остальных текстовых сообщений"""
+    await message.answer(f"Вы написали: {message.text}\n\nБот работает в режиме приема регистраций.")
 
 @router.callback_query(F.data.startswith("pay_") | F.data.startswith("cancel_"))
 async def payment_callback_handler(callback: CallbackQuery):
