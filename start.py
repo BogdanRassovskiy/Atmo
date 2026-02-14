@@ -1,7 +1,13 @@
 import os
+import django
 import asyncio
 import subprocess
 
+# Инициализация Django ПЕРЕД любыми импортами из bot
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "atmo.settings")
+django.setup()
+
+# Только ПОСЛЕ django.setup() импортируем bot
 from bot.loader import bot
 
 WEBHOOK_URL = "https://intime-studio.com/webhook/atmo/"
