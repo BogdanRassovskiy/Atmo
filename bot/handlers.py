@@ -27,28 +27,43 @@ async def payment_callback_handler(callback: CallbackQuery):
         registration_id = int(registration_id)
         print(f"Action: {action}, Registration ID: {registration_id}")
         
-        # Получаем регистрацию (sync_to_async)
-        try:
-            registration = await sync_to_async(Registration.objects.get)(id=registration_id)
-            print(f"Registration found: {registration.booking_id}")
-        except Registration.DoesNotExist:
+        # Функция для обновления регистрации (полностью синхронная)
+        @sync_to_async
+        def update_registration(reg_id, is_paid):
+            try:
+                registration = Registration.objects.get(id=reg_id)
+                registration.is_paid = is_paid
+                registration.save()
+                return {
+                    "success": True,
+                    "booking_id": registration.booking_id,
+                    "registration_id": registration.id
+                }
+            except Registration.DoesNotExist:
+                return {"success": False, "error": "not_found"}
+        
+        # Обновляем регистрацию
+        result = await update_registration(registration_id, action == 'pay')
+        
+        if not result["success"]:
             print("Registration not found!")
             await callback.message.answer("❌ Регистрация не найдена")
             return
         
-        # Обновляем статус оплаты
+        print(f"Registration updated: {result['booking_id']}")
+        
+        # Формируем статус
         if action == 'pay':
-            registration.is_paid = True
             status_text = "\n\n<b>✅ Статус: Оплачено</b>"
-            print("Setting is_paid = True")
+            print("Status set to: Paid")
             
             # Делаем запрос на внешний URL
             try:
                 response = requests.post(
                     "https://atmafest.vercel.app/",
                     json={
-                        "registration_id": registration.id,
-                        "booking_id": registration.booking_id,
+                        "registration_id": result["registration_id"],
+                        "booking_id": result["booking_id"],
                         "status": "paid"
                     },
                     timeout=5
@@ -57,12 +72,8 @@ async def payment_callback_handler(callback: CallbackQuery):
             except Exception as e:
                 print(f"Failed to notify atmafest: {e}")
         else:  # cancel
-            registration.is_paid = False
             status_text = "\n\n<b>❌ Статус: Отменено</b>"
-            print("Setting is_paid = False")
-        
-        await sync_to_async(registration.save)()
-        print("Registration saved")
+            print("Status set to: Cancelled")
         
         # Обновляем сообщение и убираем клавиатуру
         new_text = callback.message.text + status_text
@@ -72,6 +83,11 @@ async def payment_callback_handler(callback: CallbackQuery):
             reply_markup=None
         )
         print("Message updated")
+        
+    except Exception as e:
+        print(f"ERROR in payment callback: {e}")
+        print(traceback.format_exc())
+        await callback.message.answer(f"❌ Произошла ошибка: {str(e)}")
         
     except Exception as e:
         print(f"ERROR in payment callback: {e}")
