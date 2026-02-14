@@ -4,6 +4,8 @@ from aiogram.enums import ParseMode
 import os
 from .handlers import router
 
+from bot.middlewares.user import TelegramUserMiddleware
+
 
 TOKEN = "8398415384:AAE_Jpr4N7Y0Qry0EzJBGMgnDH7S7j11AtY"
 
@@ -14,6 +16,8 @@ bot = Bot(
 
 dp = Dispatcher()
 dp.include_router(router)
+dp.message.middleware(TelegramUserMiddleware())
+dp.callback_query.middleware(TelegramUserMiddleware())
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)

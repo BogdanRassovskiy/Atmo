@@ -21,12 +21,12 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = '2z1^wfv-&5umkg7m*yhgoul&e5fd*fc479akno-95i7krszz8m'
-
+TELEGRAM_BOT_TOKEN="8398415384:AAE_Jpr4N7Y0Qry0EzJBGMgnDH7S7j11AtY"
+TELEGRAM_CHAT_ID="-1003743873964"
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ["intime-studio.com", "www.intime-studio.com"]
-
+ALLOWED_HOSTS = ["*"]
 
 # Application definition
 
