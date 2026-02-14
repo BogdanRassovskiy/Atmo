@@ -16,10 +16,13 @@ async def start_handler(message: Message):
 async def payment_callback_handler(callback: CallbackQuery):
     print(f"=== Callback received: {callback.data} ===")
     
-    # Всегда отвечаем на callback сразу, чтобы убрать "часики"
-    await callback.answer("Обрабатываю...")
-    
     try:
+        # Сохраняем текст сообщения сразу
+        original_text = callback.message.text
+        
+        # Всегда отвечаем на callback сразу, чтобы убрать "часики"
+        await callback.answer("Обрабатываю...")
+        
         # Импортируем здесь чтобы избежать circular import
         from bot.models import Registration
         
@@ -28,8 +31,7 @@ async def payment_callback_handler(callback: CallbackQuery):
         print(f"Action: {action}, Registration ID: {registration_id}")
         
         # Функция для обновления регистрации (полностью синхронная)
-        @sync_to_async
-        def update_registration(reg_id, is_paid):
+        def update_registration_sync(reg_id, is_paid):
             try:
                 registration = Registration.objects.get(id=reg_id)
                 registration.is_paid = is_paid
@@ -43,7 +45,7 @@ async def payment_callback_handler(callback: CallbackQuery):
                 return {"success": False, "error": "not_found"}
         
         # Обновляем регистрацию
-        result = await update_registration(registration_id, action == 'pay')
+        result = await sync_to_async(update_registration_sync)(registration_id, action == 'pay')
         
         if not result["success"]:
             print("Registration not found!")
@@ -76,13 +78,21 @@ async def payment_callback_handler(callback: CallbackQuery):
             print("Status set to: Cancelled")
         
         # Обновляем сообщение и убираем клавиатуру
-        new_text = callback.message.text + status_text
+        new_text = original_text + status_text
         await callback.message.edit_text(
             text=new_text,
             parse_mode="HTML",
             reply_markup=None
         )
-        print("Message updated")
+        print("Message updated successfully")
+        
+    except Exception as e:
+        print(f"ERROR in payment callback: {e}")
+        print(traceback.format_exc())
+        try:
+            await callback.message.answer(f"❌ Произошла ошибка: {str(e)}")
+        except:
+            pass
         
     except Exception as e:
         print(f"ERROR in payment callback: {e}")
