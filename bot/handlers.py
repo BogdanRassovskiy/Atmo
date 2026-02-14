@@ -10,6 +10,13 @@ router = Router()
 
 @router.message(CommandStart())
 async def start_handler(message: Message):
+    # Проверяем есть ли параметр после /start
+    if message.text and len(message.text.split()) > 1:
+        param = message.text.split()[1]
+        if param == "get_my_id":
+            await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
+            return
+    
     await message.answer("Бот работает. Добро пожаловать!")
 
 @router.message()
