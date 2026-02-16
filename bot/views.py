@@ -85,6 +85,7 @@ def weblink(request):
         name = request.GET.get("name")
         phone = request.GET.get("phone")
         telegram_username = request.GET.get("telegram_username")
+        telegram_id_str = request.GET.get("telegram_id")
         game = request.GET.get("game")
         master = request.GET.get("master")
         place = request.GET.get("place")
@@ -95,11 +96,23 @@ def weblink(request):
         time_end_str = request.GET.get("time_end")
         
         # Валидация обязательных полей
-        if not telegram_username:
+        if not telegram_id_str and not telegram_username:
             return JsonResponse(
-                {"error": "telegram_username is required"},
+                {"error": "telegram_id or telegram_username is required"},
                 status=400
             )
+
+        telegram_id = None
+        if telegram_id_str:
+            try:
+                telegram_id = int(telegram_id_str)
+            except ValueError:
+                return JsonResponse(
+                    {"error": "Invalid telegram_id format"},
+                    status=400
+                )
+        elif telegram_username and telegram_username.isdigit():
+            telegram_id = int(telegram_username)
         
         if not booking_id:
             return JsonResponse(
@@ -113,20 +126,38 @@ def weblink(request):
                 status=400
             )
         
-        # Создаем или получаем пользователя по telegram_username
-        user, user_created = TelegramUser.objects.get_or_create(
-            username=telegram_username,
-            defaults={
-                "first_name": name or "",
-                "phone": phone or "",
-                "telegram_id": 0,  # будет обновлен при первом контакте с ботом
-            }
-        )
+        # Создаем или получаем пользователя по telegram_id, иначе по username
+        if telegram_id:
+            user, user_created = TelegramUser.objects.get_or_create(
+                telegram_id=telegram_id,
+                defaults={
+                    "username": telegram_username,
+                    "first_name": name or "",
+                    "phone": phone or "",
+                }
+            )
+        else:
+            user, user_created = TelegramUser.objects.get_or_create(
+                username=telegram_username,
+                defaults={
+                    "first_name": name or "",
+                    "phone": phone or "",
+                    "telegram_id": 0,  # будет обновлен при первом контакте с ботом
+                }
+            )
         
         # Обновляем данные пользователя, если он уже существовал
         if not user_created:
             updated = False
             
+            if telegram_id and user.telegram_id != telegram_id:
+                user.telegram_id = telegram_id
+                updated = True
+
+            if telegram_username and user.username != telegram_username:
+                user.username = telegram_username
+                updated = True
+
             if name and user.first_name != name:
                 user.first_name = name
                 updated = True
@@ -191,32 +222,6 @@ def weblink(request):
 
 Реквизиты для оплаты: 1234 5678 9012 3456"""
             send_to_telegram(welcome_message)
-        
-        # Проверяем количество регистраций пользователя
-        if registration_created:  # Только если была создана новая регистрация
-            total_registrations = Registration.objects.filter(user=user).count()
-            if total_registrations == 4:
-                four_games_message = f"""✨ Регистрация завершена ✨
-
-Благодарим за оплату, Ваше участие подтверждено.
-
-Ваш регистрационный номер: {registration.id}    
-
-Игры:
-1 день -  (11:00 - 13:00)
-2 день - (14:30 - 16:30)
-
-
-Обед: 13:00 - 14:30
-
-❗️Необходимо придти к 10:30 
-
-Адрес:
-
-Рады, что Вы с нами в этом пространстве трансформации.
-
-До скорой встречи на фестивале ✨"""
-                send_to_telegram(four_games_message)
         
         return JsonResponse({
             "success": True,

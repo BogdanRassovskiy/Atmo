@@ -1,10 +1,11 @@
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart
 from asgiref.sync import sync_to_async
 import requests
 from django.conf import settings
 import traceback
+from bot.models import Registration, TelegramUser
 
 router = Router()
 
@@ -19,18 +20,127 @@ async def start_handler(message: Message):
     
     await message.answer("Бот работает. Добро пожаловать!")
 
+def _resolve_user_registrations_sync(db_user_id, username):
+    user = TelegramUser.objects.get(id=db_user_id)
+    registrations = Registration.objects.filter(user=user)
+
+    if not registrations.exists() and username:
+        alt_user = (
+            TelegramUser.objects.filter(username__iexact=username)
+            .exclude(id=user.id)
+            .first()
+        )
+        if alt_user:
+            Registration.objects.filter(user=alt_user).update(user=user)
+            registrations = Registration.objects.filter(user=user)
+
+    return {
+        "user_id": user.id,
+        "total": registrations.count(),
+        "unpaid": registrations.filter(is_paid=False).count(),
+    }
+
+
+def _set_user_step_sync(user_id, step):
+    TelegramUser.objects.filter(id=user_id).update(step=step)
+
+
+def _get_latest_unpaid_registration_id_sync(user_id):
+    registration = (
+        Registration.objects.filter(user_id=user_id, is_paid=False)
+        .order_by("-created_at")
+        .first()
+    )
+    return registration.id if registration else None
+
+
+def _build_payment_keyboard(registration_id):
+    if not registration_id:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Оплачено", callback_data=f"pay_{registration_id}"),
+            InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_{registration_id}"),
+        ]]
+    )
+
+
 @router.message()
-async def echo_handler(message: Message):
-    """Обработчик всех остальных текстовых сообщений"""
-    await message.answer(f"Вы написали: {message.text}\n\nБот работает в режиме приема регистраций.")
+async def echo_handler(message: Message, db_user: TelegramUser):
+    """Обработчик всех остальных сообщений"""
+    if db_user.step == "awaiting_payment_screenshot":
+        if message.photo:
+            registration_id = await sync_to_async(_get_latest_unpaid_registration_id_sync)(
+                db_user.id
+            )
+            caption = (
+                "Оплата от пользователя\n"
+                f"ID: {message.from_user.id}\n"
+                f"Username: @{message.from_user.username or '-'}"
+            )
+            await message.bot.send_photo(
+                chat_id=settings.TELEGRAM_CHAT_ID,
+                photo=message.photo[-1].file_id,
+                caption=caption,
+                reply_markup=_build_payment_keyboard(registration_id),
+            )
+            await sync_to_async(_set_user_step_sync)(db_user.id, "start")
+            await message.answer("Спасибо! Скриншот оплаты отправлен на проверку.")
+            return
+
+        if message.document and (message.document.mime_type or "").startswith("image/"):
+            registration_id = await sync_to_async(_get_latest_unpaid_registration_id_sync)(
+                db_user.id
+            )
+            caption = (
+                "Оплата от пользователя\n"
+                f"ID: {message.from_user.id}\n"
+                f"Username: @{message.from_user.username or '-'}"
+            )
+            await message.bot.send_document(
+                chat_id=settings.TELEGRAM_CHAT_ID,
+                document=message.document.file_id,
+                caption=caption,
+                reply_markup=_build_payment_keyboard(registration_id),
+            )
+            await sync_to_async(_set_user_step_sync)(db_user.id, "start")
+            await message.answer("Спасибо! Скриншот оплаты отправлен на проверку.")
+            return
+
+        await message.answer("Пожалуйста, пришлите скриншот оплаты файлом или фото.")
+        return
+
+    user_info = await sync_to_async(_resolve_user_registrations_sync)(
+        db_user.id,
+        message.from_user.username,
+    )
+
+    if user_info["unpaid"] > 0:
+        payment_text = (
+            "Для завершения регистрации необходимо внести 100% оплату участия.\n\n"
+            "Реквизиты для оплаты: 1234 5678 9012 3456\n\n"
+            "После оплаты отправьте скриншот в этот чат."
+        )
+        await sync_to_async(_set_user_step_sync)(db_user.id, "awaiting_payment_screenshot")
+        await message.answer(payment_text)
+        return
+
+    if message.text:
+        await message.answer(
+            f"Вы написали: {message.text}\n\n"
+            "Бот работает в режиме приема регистраций."
+        )
+        return
+
+    await message.answer("Бот работает в режиме приема регистраций.")
 
 @router.callback_query(F.data.startswith("pay_") | F.data.startswith("cancel_"))
 async def payment_callback_handler(callback: CallbackQuery):
     print(f"=== Callback received: {callback.data} ===")
     
     try:
-        # Сохраняем текст сообщения сразу
-        original_text = callback.message.text
+        # Сохраняем текст сообщения сразу (для фото используем caption)
+        original_text = callback.message.text or callback.message.caption or ""
         
         # Всегда отвечаем на callback сразу, чтобы убрать "часики"
         await callback.answer("Обрабатываю...")
@@ -46,15 +156,23 @@ async def payment_callback_handler(callback: CallbackQuery):
         def update_registration_sync(reg_id, is_paid):
             try:
                 registration = Registration.objects.get(id=reg_id)
+                was_paid = registration.is_paid
                 registration.is_paid = is_paid
                 registration.save()
                 return {
                     "success": True,
                     "booking_id": registration.booking_id,
-                    "registration_id": registration.id
+                    "registration_id": registration.id,
+                    "user_telegram_id": registration.user.telegram_id,
+                    "user_username": registration.user.username,
+                    "user_id": registration.user_id,
+                    "was_paid": was_paid,
                 }
             except Registration.DoesNotExist:
                 return {"success": False, "error": "not_found"}
+
+        def get_paid_registrations_count_sync(user_id):
+            return Registration.objects.filter(user_id=user_id, is_paid=True).count()
         
         # Обновляем регистрацию
         result = await sync_to_async(update_registration_sync)(registration_id, action == 'pay')
@@ -74,7 +192,7 @@ async def payment_callback_handler(callback: CallbackQuery):
             # Делаем запрос на внешний URL
             try:
                 response = requests.post(
-                    "https://atmafest.vercel.app/",
+                    "https://atmafest.vercel.app/#games",
                     json={
                         "registration_id": result["registration_id"],
                         "booking_id": result["booking_id"],
@@ -85,17 +203,69 @@ async def payment_callback_handler(callback: CallbackQuery):
                 print(f"External API response: {response.status_code}")
             except Exception as e:
                 print(f"Failed to notify atmafest: {e}")
+
+            if result.get("user_telegram_id"):
+                link = "https://atmafest.vercel.app/#games"
+                username = result.get("user_username") or "-"
+                notify_text = (
+                    "✅ Оплата подтверждена.\n"
+                    "Перейдите по ссылке и выберите еще игр:"
+                )
+                link_keyboard = InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="Перейти на сайт", url=link)]]
+                )
+                try:
+                    await callback.bot.send_message(
+                        result["user_telegram_id"],
+                        notify_text,
+                        reply_markup=link_keyboard,
+                    )
+                except Exception as e:
+                    print(f"Failed to notify user about payment: {e}")
+
+            if result.get("user_telegram_id") and not result.get("was_paid"):
+                paid_count = await sync_to_async(get_paid_registrations_count_sync)(
+                    result["user_id"]
+                )
+                if paid_count == 4:
+                    four_games_message = (
+                        "✨ Регистрация завершена ✨\n\n"
+                        "Благодарим за оплату, Ваше участие подтверждено.\n\n"
+                        f"Ваш регистрационный номер: {result['registration_id']}\n\n"
+                        "Игры:\n"
+                        "1 день -  (11:00 - 13:00)\n"
+                        "2 день - (14:30 - 16:30)\n\n"
+                        "Обед: 13:00 - 14:30\n\n"
+                        "❗️Необходимо придти к 10:30 \n\n"
+                        "Адрес:\n\n"
+                        "Рады, что Вы с нами в этом пространстве трансформации.\n\n"
+                        "До скорой встречи на фестивале ✨"
+                    )
+                    try:
+                        await callback.bot.send_message(
+                            result["user_telegram_id"],
+                            four_games_message,
+                        )
+                    except Exception as e:
+                        print(f"Failed to notify user about 4 paid regs: {e}")
         else:  # cancel
             status_text = "\n\n<b>❌ Статус: Отменено</b>"
             print("Status set to: Cancelled")
         
         # Обновляем сообщение и убираем клавиатуру
         new_text = original_text + status_text
-        await callback.message.edit_text(
-            text=new_text,
-            parse_mode="HTML",
-            reply_markup=None
-        )
+        if callback.message.photo or callback.message.document:
+            await callback.message.edit_caption(
+                caption=new_text,
+                parse_mode="HTML",
+                reply_markup=None,
+            )
+        else:
+            await callback.message.edit_text(
+                text=new_text,
+                parse_mode="HTML",
+                reply_markup=None,
+            )
         print("Message updated successfully")
         
     except Exception as e:
