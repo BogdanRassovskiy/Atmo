@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes" />
+    <title>ATMA FEST - Фестиваль Трансформации</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Playfair+Display:ital,wght@0,400;0,600;0,700;1,400&display=swap" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              atma: {
+                cream: '#e8e0d4', // Light tan/beige from logo
+                brown: '#7a5f4f', // Medium brown from logo
+                darkBrown: '#2d1f18', // Dark brown/black from logo
+                teal: '#6b9a92', // Muted teal/blue-green from logo
+                darkTeal: '#5a8a82', // Darker teal variant
+                gold: '#8b6f5e', // Warm brown-gold accent
+                sand: '#d4c5b8' // Light sand/tan
+              }
+            },
+            fontFamily: {
+              sans: ['Inter', 'sans-serif'],
+              serif: ['Playfair Display', 'serif'],
+            },
+            boxShadow: {
+              'soft': '0 10px 40px -10px rgba(0,0,0,0.08)',
+              'glow': '0 0 20px rgba(107, 154, 146, 0.3)'
+            }
+          }
+        }
+      }
+    </script>
+    <style>
+      html {
+        scroll-behavior: smooth;
+      }
+      body {
+        background-color: #e8e0d4;
+        color: #2d1f18;
+        overflow-x: hidden;
+        -webkit-overflow-scrolling: touch;
+      }
+      * {
+        -webkit-tap-highlight-color: transparent;
+      }
+      /* Better touch scrolling on mobile */
+      .overflow-y-auto, .overflow-auto {
+        -webkit-overflow-scrolling: touch;
+        overscroll-behavior: contain;
+      }
+      /* Prevent horizontal scroll on mobile */
+      html, body {
+        max-width: 100%;
+        overflow-x: hidden;
+      }
+      /* Hide scrollbar for clean modal */
+      .custom-scrollbar::-webkit-scrollbar {
+        width: 6px;
+      }
+      .custom-scrollbar::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      .custom-scrollbar::-webkit-scrollbar-thumb {
+        background-color: #d4c5b8;
+        border-radius: 20px;
+      }
+    </style>
+
+  <script type="importmap">
+{
+  "imports": {
+    "lucide-react": "https://esm.sh/lucide-react@^0.563.0",
+    "react/": "https://esm.sh/react@^19.2.4/",
+    "react": "https://esm.sh/react@^19.2.4",
+    "react-dom/": "https://esm.sh/react-dom@^19.2.4/"
+  }
+}
+</script>
+  <script type="module" crossorigin src="/static/atmafest/assets/app.js"></script>
+  <link rel="stylesheet" crossorigin href="/static/atmafest/assets/app.css">
+</head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

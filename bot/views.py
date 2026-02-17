@@ -1,6 +1,7 @@
 from django.http import JsonResponse
+from django.shortcuts import render
 from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_POST
+from django.views.decorators.http import require_http_methods
 from django.utils import timezone
 from django.conf import settings
 from asgiref.sync import async_to_sync
@@ -9,6 +10,7 @@ from .loader import bot, dp
 from .models import TelegramUser, Registration
 import json
 import requests
+import uuid
 from datetime import datetime, time
 
 
@@ -30,7 +32,7 @@ def format_registration_message(registration, user, is_new):
 
 <b>👤 Имя:</b> {user.first_name or '-'}
 <b>📞 Телефон:</b> {user.phone or '-'}
-<b>💬 Telegram:</b> @{user.username or '-'}
+<b>💬 Telegram ID:</b> {user.telegram_id or '-'}
 
 <b>🎲 Игра:</b> {registration.game}
 <b>🎤 Мастер:</b> {registration.master}
@@ -47,7 +49,7 @@ def format_registration_message(registration, user, is_new):
 <b>🕓 Дата регистрации:</b> {registration.created_at.strftime('%d.%m.%Y %H:%M')}
 """
 
-def send_to_telegram(message: str, registration_id: int = None):
+def send_to_telegram(message: str, registration_ref: str = None):
     try:
         url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
@@ -56,17 +58,17 @@ def send_to_telegram(message: str, registration_id: int = None):
             "parse_mode": "HTML"
         }
         
-        # Добавляем inline кнопки если передан registration_id
-        if registration_id:
+        # Добавляем inline кнопки если передан идентификатор регистрации
+        if registration_ref:
             payload["reply_markup"] = {
                 "inline_keyboard": [[
                     {
                         "text": "✅ Оплачено",
-                        "callback_data": f"pay_{registration_id}"
+                        "callback_data": f"pay_{registration_ref}"
                     },
                     {
                         "text": "❌ Отменить",
-                        "callback_data": f"cancel_{registration_id}"
+                        "callback_data": f"cancel_{registration_ref}"
                     }
                 ]]
             }
@@ -210,7 +212,7 @@ def weblink(request):
         
         # Отправляем уведомление в Telegram
         message = format_registration_message(registration, user, registration_created)
-        send_to_telegram(message, registration.id)
+        send_to_telegram(message, registration.booking_id)
         
         # Если пользователь новый - отправляем приветственное сообщение
         if user_created:
@@ -238,3 +240,183 @@ def weblink(request):
             {"error": str(e)},
             status=500
         )
+
+
+def atmafest_app(request):
+    return render(request, "atmafest.html")
+
+
+def _normalize_phone(phone):
+    if not phone:
+        return ""
+    return "".join(ch for ch in str(phone) if ch.isdigit())
+
+
+def _normalize_telegram_id(telegram_id):
+    if telegram_id is None:
+        return None
+    normalized = "".join(ch for ch in str(telegram_id).strip() if ch.isdigit() or ch == "-")
+    if not normalized:
+        return None
+    try:
+        return int(normalized)
+    except ValueError:
+        return None
+
+
+def _generate_booking_id():
+    return f"ATMA-{int(timezone.now().timestamp() * 1000)}-{uuid.uuid4().hex[:8].upper()}"
+
+
+def _generate_temp_telegram_id():
+    while True:
+        candidate = -int(uuid.uuid4().int % 9_000_000_000_000_000_000) - 1
+        if not TelegramUser.objects.filter(telegram_id=candidate).exists():
+            return candidate
+
+
+def _get_or_create_user(name, phone, telegram_id):
+    normalized_telegram_id = _normalize_telegram_id(telegram_id)
+
+    user = None
+    if normalized_telegram_id is not None:
+        user = TelegramUser.objects.filter(telegram_id=normalized_telegram_id).first()
+
+    if not user and phone:
+        user = TelegramUser.objects.filter(phone=phone).first()
+
+    if user:
+        updated = False
+        if name and user.first_name != name:
+            user.first_name = name
+            updated = True
+        if phone and user.phone != phone:
+            user.phone = phone
+            updated = True
+        if normalized_telegram_id is not None and user.telegram_id != normalized_telegram_id:
+            user.telegram_id = normalized_telegram_id
+            updated = True
+        if updated:
+            user.save(update_fields=["first_name", "phone", "telegram_id", "updated_at"])
+        return user
+
+    return TelegramUser.objects.create(
+        telegram_id=normalized_telegram_id if normalized_telegram_id is not None else _generate_temp_telegram_id(),
+        username=None,
+        first_name=name or "Гость",
+        phone=phone or "",
+    )
+
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def bookings_collection(request):
+    if request.method == "GET":
+        registrations = (
+            Registration.objects.select_related("user")
+            .order_by("-created_at")
+        )
+        bookings = [
+            {
+                "bookingId": item.booking_id,
+                "timestamp": item.created_at.isoformat(),
+                "name": item.user.first_name,
+                "phone": item.user.phone,
+                "telegramId": item.user.telegram_id,
+                "gameTitle": item.game,
+                "masterName": item.master,
+                "day": item.day,
+                "line": item.line,
+                "seatNumber": item.place_number,
+            }
+            for item in registrations
+        ]
+        return JsonResponse({"success": True, "bookings": bookings})
+
+    try:
+        payload = json.loads(request.body.decode("utf-8"))
+    except json.JSONDecodeError:
+        return JsonResponse({"success": False, "error": "Invalid JSON"}, status=400)
+
+    form_data = payload.get("formData") or {}
+    master_name = payload.get("masterName")
+    game_title = payload.get("gameTitle")
+    seat_number = payload.get("seatNumber")
+    day = payload.get("day")
+    line = payload.get("line")
+
+    name = form_data.get("name")
+    phone = form_data.get("phone")
+    telegram_id = form_data.get("telegramId") or form_data.get("telegram")
+    slot_id = form_data.get("slotId")
+    seat_id = form_data.get("seatId")
+
+    if not all([master_name, game_title, seat_number, day, line, slot_id, seat_id]):
+        return JsonResponse({"success": False, "error": "Missing required fields"}, status=400)
+
+    try:
+        seat_number = int(seat_number)
+        day = int(day)
+        line = int(line)
+        seat_id = int(seat_id)
+    except (TypeError, ValueError):
+        return JsonResponse({"success": False, "error": "Invalid numeric fields"}, status=400)
+
+    if Registration.objects.filter(slot_id=slot_id, seat_id=seat_id).exists():
+        return JsonResponse({"success": False, "error": "Seat is already booked"}, status=400)
+
+    by_phone = 0
+    if _normalize_phone(phone):
+        by_phone = Registration.objects.filter(day=day, user__phone=phone).count()
+
+    by_telegram_id = 0
+    normalized_telegram_id = _normalize_telegram_id(telegram_id)
+    if normalized_telegram_id is not None:
+        by_telegram_id = Registration.objects.filter(day=day, user__telegram_id=normalized_telegram_id).count()
+
+    if max(by_phone, by_telegram_id) >= 2:
+        return JsonResponse({"success": False, "error": "MAX_PER_DAY"}, status=400)
+
+    user = _get_or_create_user(name=name, phone=phone, telegram_id=telegram_id)
+    booking_id = _generate_booking_id()
+
+    registration = Registration.objects.create(
+        user=user,
+        booking_id=booking_id,
+        slot_id=slot_id,
+        seat_id=seat_id,
+        game=game_title,
+        master=master_name,
+        place_number=seat_number,
+        day=day,
+        line=line,
+        time_start=time(0, 0),
+        time_end=time(0, 0),
+        created_at=timezone.now(),
+    )
+
+    message = format_registration_message(registration, user, True)
+    send_to_telegram(message, registration.booking_id)
+
+    return JsonResponse({"success": True, "bookingId": booking_id}, status=201)
+
+
+@require_http_methods(["GET"])
+def bookings_seats(request, slot_id):
+    seat_ids = list(
+        Registration.objects.filter(slot_id=slot_id)
+        .exclude(seat_id__isnull=True)
+        .values_list("seat_id", flat=True)
+    )
+    return JsonResponse({"success": True, "bookedSeats": seat_ids})
+
+
+@csrf_exempt
+@require_http_methods(["DELETE"])
+def booking_detail(request, booking_id):
+    registration = Registration.objects.filter(booking_id=booking_id).first()
+    if not registration:
+        return JsonResponse({"success": False, "error": "Booking not found"}, status=404)
+
+    registration.delete()
+    return JsonResponse({"success": True})

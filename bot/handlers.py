@@ -10,12 +10,21 @@ from bot.models import Registration, TelegramUser
 router = Router()
 
 @router.message(CommandStart())
-async def start_handler(message: Message):
+async def start_handler(message: Message, db_user: TelegramUser):
     # Проверяем есть ли параметр после /start
     if message.text and len(message.text.split()) > 1:
         param = message.text.split()[1]
         if param == "get_my_id":
             await message.answer(f"<code>{message.from_user.id}</code>", parse_mode="HTML")
+            return
+        if param == "pay":
+            payment_text = (
+                "Для завершения регистрации необходимо внести 100% оплату участия.\n\n"
+                "Реквизиты для оплаты: 1234 5678 9012 3456\n\n"
+                "После оплаты отправьте скриншот в этот чат."
+            )
+            await sync_to_async(_set_user_step_sync)(db_user.id, "awaiting_payment_screenshot")
+            await message.answer(payment_text)
             return
     
     await message.answer("Бот работает. Добро пожаловать!")
@@ -45,22 +54,22 @@ def _set_user_step_sync(user_id, step):
     TelegramUser.objects.filter(id=user_id).update(step=step)
 
 
-def _get_latest_unpaid_registration_id_sync(user_id):
+def _get_latest_unpaid_registration_ref_sync(user_id):
     registration = (
         Registration.objects.filter(user_id=user_id, is_paid=False)
         .order_by("-created_at")
         .first()
     )
-    return registration.id if registration else None
+    return registration.booking_id if registration else None
 
 
-def _build_payment_keyboard(registration_id):
-    if not registration_id:
+def _build_payment_keyboard(registration_ref):
+    if not registration_ref:
         return None
     return InlineKeyboardMarkup(
         inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Оплачено", callback_data=f"pay_{registration_id}"),
-            InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_{registration_id}"),
+            InlineKeyboardButton(text="✅ Оплачено", callback_data=f"pay_{registration_ref}"),
+            InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_{registration_ref}"),
         ]]
     )
 
@@ -70,7 +79,7 @@ async def echo_handler(message: Message, db_user: TelegramUser):
     """Обработчик всех остальных сообщений"""
     if db_user.step == "awaiting_payment_screenshot":
         if message.photo:
-            registration_id = await sync_to_async(_get_latest_unpaid_registration_id_sync)(
+            registration_ref = await sync_to_async(_get_latest_unpaid_registration_ref_sync)(
                 db_user.id
             )
             caption = (
@@ -82,14 +91,14 @@ async def echo_handler(message: Message, db_user: TelegramUser):
                 chat_id=settings.TELEGRAM_CHAT_ID,
                 photo=message.photo[-1].file_id,
                 caption=caption,
-                reply_markup=_build_payment_keyboard(registration_id),
+                reply_markup=_build_payment_keyboard(registration_ref),
             )
             await sync_to_async(_set_user_step_sync)(db_user.id, "start")
             await message.answer("Спасибо! Скриншот оплаты отправлен на проверку.")
             return
 
         if message.document and (message.document.mime_type or "").startswith("image/"):
-            registration_id = await sync_to_async(_get_latest_unpaid_registration_id_sync)(
+            registration_ref = await sync_to_async(_get_latest_unpaid_registration_ref_sync)(
                 db_user.id
             )
             caption = (
@@ -101,7 +110,7 @@ async def echo_handler(message: Message, db_user: TelegramUser):
                 chat_id=settings.TELEGRAM_CHAT_ID,
                 document=message.document.file_id,
                 caption=caption,
-                reply_markup=_build_payment_keyboard(registration_id),
+                reply_markup=_build_payment_keyboard(registration_ref),
             )
             await sync_to_async(_set_user_step_sync)(db_user.id, "start")
             await message.answer("Спасибо! Скриншот оплаты отправлен на проверку.")
@@ -148,17 +157,34 @@ async def payment_callback_handler(callback: CallbackQuery):
         # Импортируем здесь чтобы избежать circular import
         from bot.models import Registration
         
-        action, registration_id = callback.data.split('_')
-        registration_id = int(registration_id)
-        print(f"Action: {action}, Registration ID: {registration_id}")
+        action, registration_ref = callback.data.split('_', 1)
+        print(f"Action: {action}, Registration ref: {registration_ref}")
         
         # Функция для обновления регистрации (полностью синхронная)
-        def update_registration_sync(reg_id, is_paid):
+        def update_registration_sync(reg_ref, action_name):
             try:
-                registration = Registration.objects.get(id=reg_id)
+                registration = None
+
+                # Новый формат: booking_id в callback_data
+                if reg_ref and not str(reg_ref).isdigit():
+                    registration = Registration.objects.filter(booking_id=reg_ref).first()
+
+                # Легаси-формат: numeric Registration.id в callback_data
+                if registration is None and str(reg_ref).isdigit():
+                    registration = Registration.objects.filter(id=int(reg_ref)).first()
+
+                if registration is None:
+                    raise Registration.DoesNotExist
+
                 was_paid = registration.is_paid
-                registration.is_paid = is_paid
-                registration.save()
+                if action_name == 'pay':
+                    registration.is_paid = True
+                    registration.save()
+                    deleted = False
+                else:
+                    registration.delete()
+                    deleted = True
+
                 return {
                     "success": True,
                     "booking_id": registration.booking_id,
@@ -167,6 +193,7 @@ async def payment_callback_handler(callback: CallbackQuery):
                     "user_username": registration.user.username,
                     "user_id": registration.user_id,
                     "was_paid": was_paid,
+                    "deleted": deleted,
                 }
             except Registration.DoesNotExist:
                 return {"success": False, "error": "not_found"}
@@ -175,7 +202,7 @@ async def payment_callback_handler(callback: CallbackQuery):
             return Registration.objects.filter(user_id=user_id, is_paid=True).count()
         
         # Обновляем регистрацию
-        result = await sync_to_async(update_registration_sync)(registration_id, action == 'pay')
+        result = await sync_to_async(update_registration_sync)(registration_ref, action)
         
         if not result["success"]:
             print("Registration not found!")
@@ -249,8 +276,22 @@ async def payment_callback_handler(callback: CallbackQuery):
                     except Exception as e:
                         print(f"Failed to notify user about 4 paid regs: {e}")
         else:  # cancel
-            status_text = "\n\n<b>❌ Статус: Отменено</b>"
+            status_text = "\n\n<b>❌ Статус: Отменено (заявка удалена)</b>"
             print("Status set to: Cancelled")
+
+            if result.get("user_telegram_id"):
+                cancel_text = (
+                    "❌ Ваша заявка отменена администратором.\n"
+                    "Место освобождено.\n\n"
+                    "Если это произошло по ошибке, пожалуйста, зарегистрируйтесь снова на сайте."
+                )
+                try:
+                    await callback.bot.send_message(
+                        result["user_telegram_id"],
+                        cancel_text,
+                    )
+                except Exception as e:
+                    print(f"Failed to notify user about cancellation: {e}")
         
         # Обновляем сообщение и убираем клавиатуру
         new_text = original_text + status_text

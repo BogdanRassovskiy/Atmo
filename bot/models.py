@@ -34,6 +34,8 @@ class Registration(models.Model):
     )
 
     booking_id = models.CharField(max_length=255, unique=True)
+    slot_id = models.CharField(max_length=255, null=True, blank=True, db_index=True)
+    seat_id = models.IntegerField(null=True, blank=True)
 
     game = models.CharField(max_length=255)
     master = models.CharField(max_length=255)
