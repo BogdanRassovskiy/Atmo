@@ -14,6 +14,11 @@ class TelegramUser(models.Model):
     )
     is_vip = models.BooleanField(default=False)
     is_blocked = models.BooleanField(default=False)
+    participation_days = models.PositiveSmallIntegerField(
+        default=2,
+        choices=((1, "1_day"), (2, "2_days")),
+    )
+    registration_number = models.BigIntegerField(null=True, blank=True, unique=True, db_index=True)
     # === Гибкие данные ===
     meta = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

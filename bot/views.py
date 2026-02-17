@@ -4,6 +4,8 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 from django.utils import timezone
 from django.conf import settings
+from django.db import transaction
+from django.db.models import Max
 from asgiref.sync import async_to_sync
 from aiogram.types import Update
 from .loader import bot, dp
@@ -12,6 +14,9 @@ import json
 import requests
 import uuid
 from datetime import datetime, time
+
+
+REGISTRATION_NUMBER_START = 1104000
 
 
 @csrf_exempt
@@ -268,6 +273,26 @@ def _generate_booking_id():
     return f"ATMA-{int(timezone.now().timestamp() * 1000)}-{uuid.uuid4().hex[:8].upper()}"
 
 
+def _assign_next_registration_number(user_id):
+    with transaction.atomic():
+        user = TelegramUser.objects.select_for_update().get(id=user_id)
+        max_number = TelegramUser.objects.exclude(registration_number__isnull=True).aggregate(
+            max_num=Max("registration_number")
+        )["max_num"]
+        next_number = (max_number + 1) if max_number is not None else REGISTRATION_NUMBER_START
+        user.registration_number = next_number
+        user.save(update_fields=["registration_number", "updated_at"])
+        return next_number
+
+
+def _resolve_times_by_line(line):
+    if line == 1:
+        return time(11, 0), time(13, 0)
+    if line == 2:
+        return time(14, 30), time(16, 30)
+    return time(0, 0), time(0, 0)
+
+
 def _generate_temp_telegram_id():
     while True:
         candidate = -int(uuid.uuid4().int % 9_000_000_000_000_000_000) - 1
@@ -378,6 +403,28 @@ def bookings_collection(request):
         return JsonResponse({"success": False, "error": "MAX_PER_DAY"}, status=400)
 
     user = _get_or_create_user(name=name, phone=phone, telegram_id=telegram_id)
+
+    booked_days = list(
+        Registration.objects.filter(user=user)
+        .values_list("day", flat=True)
+        .distinct()
+    )
+    if user.participation_days == 1 and booked_days and day not in booked_days:
+        return JsonResponse(
+            {
+                "success": False,
+                "error": "ONE_DAY_MODE_DAY_LOCK",
+                "lockedDay": min(booked_days),
+            },
+            status=400,
+        )
+
+    if Registration.objects.filter(user=user, day=day, line=line).exists():
+        return JsonResponse({"success": False, "error": "ALREADY_BOOKED_THIS_TIME"}, status=400)
+
+    _assign_next_registration_number(user.id)
+    time_start, time_end = _resolve_times_by_line(line)
+
     booking_id = _generate_booking_id()
 
     registration = Registration.objects.create(
@@ -390,8 +437,8 @@ def bookings_collection(request):
         place_number=seat_number,
         day=day,
         line=line,
-        time_start=time(0, 0),
-        time_end=time(0, 0),
+        time_start=time_start,
+        time_end=time_end,
         created_at=timezone.now(),
     )
 
