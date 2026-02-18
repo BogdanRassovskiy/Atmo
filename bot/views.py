@@ -17,6 +17,29 @@ from datetime import datetime, time
 
 
 REGISTRATION_NUMBER_START = 1104000
+WEB_USER_COOKIE_NAME = "atmo_web_user_id"
+WEB_USER_COOKIE_MAX_AGE = 60 * 60 * 24 * 365
+
+
+def _set_web_user_cookie(response, user):
+    if user and user.web_user_id:
+        response.set_cookie(
+            WEB_USER_COOKIE_NAME,
+            str(user.web_user_id),
+            max_age=WEB_USER_COOKIE_MAX_AGE,
+            secure=not settings.DEBUG,
+            httponly=True,
+            samesite="Lax",
+        )
+    return response
+
+
+def _paid_mode_label(user):
+    if user.paid_participation_days == 2:
+        return "✅ Оплачен режим: 2 дня (600 000 сум)"
+    if user.paid_participation_days == 1:
+        return "✅ Оплачен режим: 1 день (450 000 сум)"
+    return "❌ Режим участия не оплачен"
 
 
 @csrf_exempt
@@ -38,6 +61,7 @@ def format_registration_message(registration, user, is_new):
 <b>👤 Имя:</b> {user.first_name or '-'}
 <b>📞 Телефон:</b> {user.phone or '-'}
 <b>💬 Telegram ID:</b> {user.telegram_id or '-'}
+<b>💼 Режим:</b> {_paid_mode_label(user)}
 
 <b>🎲 Игра:</b> {registration.game}
 <b>🎤 Мастер:</b> {registration.master}
@@ -200,24 +224,31 @@ def weblink(request):
         
         # Создаем или обновляем регистрацию
         # Если пользователь уже регистрировался на эту игру - обновляем
+        auto_paid = user.paid_participation_days in (1, 2)
+        defaults = {
+            "booking_id": booking_id,
+            "master": master,
+            "place_number": int(place),
+            "day": int(day),
+            "line": int(line),
+            "time_start": time_start or time(0, 0),
+            "time_end": time_end or time(0, 0),
+            "created_at": timezone.now(),
+        }
+        if auto_paid:
+            defaults["is_paid"] = True
+
         registration, registration_created = Registration.objects.update_or_create(
             user=user,
             game=game,
-            defaults={
-                "booking_id": booking_id,
-                "master": master,
-                "place_number": int(place),
-                "day": int(day),
-                "line": int(line),
-                "time_start": time_start or time(0, 0),
-                "time_end": time_end or time(0, 0),
-                "created_at": timezone.now(),
-            }
+            defaults=defaults,
         )
         
         # Отправляем уведомление в Telegram
         message = format_registration_message(registration, user, registration_created)
-        send_to_telegram(message, registration.booking_id)
+        send_to_telegram(message, None if auto_paid else registration.booking_id)
+        if registration_created:
+            _send_completion_message_if_reached(user)
         
         # Если пользователь новый - отправляем приветственное сообщение
         if user_created:
@@ -276,6 +307,8 @@ def _generate_booking_id():
 def _assign_next_registration_number(user_id):
     with transaction.atomic():
         user = TelegramUser.objects.select_for_update().get(id=user_id)
+        if user.registration_number is not None:
+            return user.registration_number
         max_number = TelegramUser.objects.exclude(registration_number__isnull=True).aggregate(
             max_num=Max("registration_number")
         )["max_num"]
@@ -283,6 +316,92 @@ def _assign_next_registration_number(user_id):
         user.registration_number = next_number
         user.save(update_fields=["registration_number", "updated_at"])
         return next_number
+
+
+def _build_completion_message(registration_number, participation_days, games_map):
+    day1_line1 = games_map.get((1, 1), "-")
+    day1_line2 = games_map.get((1, 2), "-")
+
+    parts = [
+        "✨ Регистрация завершена ✨",
+        "",
+        "Благодарим за оплату, Ваше участие подтверждено.",
+        "",
+        f"Ваш регистрационный номер: {registration_number}",
+        "",
+        "Игры:",
+        "1 день (11:00 - 13:00)",
+        f"1 линия: {day1_line1}",
+        f"2 линия: {day1_line2}",
+        "",
+        "Обед: 13:00 - 14:30",
+        "",
+    ]
+
+    if participation_days == 2:
+        day2_line1 = games_map.get((2, 1), "-")
+        day2_line2 = games_map.get((2, 2), "-")
+        parts.extend([
+            "2 день (14:30 - 16:30)",
+            f"1 линия: {day2_line1}",
+            f"2: линия: {day2_line2}",
+            "",
+        ])
+
+    parts.extend([
+        "❗️Необходимо придти к 10:30 ",
+        "",
+        "Адрес: fakestreet 742",
+        "",
+        "Рады, что Вы с нами в этом пространстве трансформации.",
+        "",
+        "До скорой встречи на фестивале ✨",
+    ])
+
+    return "\n".join(parts)
+
+
+def _send_user_telegram_message(telegram_id, message):
+    if not telegram_id or telegram_id < 0:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": telegram_id,
+            "text": message,
+            "parse_mode": "HTML",
+        }
+        res = requests.post(url, json=payload, timeout=5)
+        res.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"Failed to send user telegram message: {e}")
+        return False
+
+
+def _send_completion_message_if_reached(user):
+    if user.paid_participation_days not in (1, 2):
+        return False
+
+    required_games = _get_allowed_games_by_paid_mode(user)
+    total_registrations = Registration.objects.filter(user=user).count()
+    if total_registrations != required_games:
+        return False
+
+    registration_number = _assign_next_registration_number(user.id)
+    regs = Registration.objects.filter(user=user).order_by("day", "line", "created_at")
+    games_map = {}
+    for reg in regs:
+        key = (reg.day, reg.line)
+        if key not in games_map:
+            games_map[key] = reg.game
+
+    completion_message = _build_completion_message(
+        registration_number=registration_number,
+        participation_days=user.participation_days,
+        games_map=games_map,
+    )
+    return _send_user_telegram_message(user.telegram_id, completion_message)
 
 
 def _resolve_times_by_line(line):
@@ -300,12 +419,65 @@ def _generate_temp_telegram_id():
             return candidate
 
 
-def _get_or_create_user(name, phone, telegram_id):
+def _normalize_web_user_id(raw_web_user_id):
+    if not raw_web_user_id:
+        return None
+    try:
+        return uuid.UUID(str(raw_web_user_id).strip())
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _parse_participation_days(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed in (1, 2) else None
+
+
+def _get_allowed_games_by_paid_mode(user):
+    return 4 if user.paid_participation_days == 2 else 2
+
+
+def _apply_participation_mode(user, participation_days):
+    target_days = _parse_participation_days(participation_days)
+    if target_days is None:
+        return None
+
+    if user.participation_days == target_days:
+        if not user.participation_days_selected:
+            user.participation_days_selected = True
+            user.save(update_fields=["participation_days_selected", "updated_at"])
+        return None
+
+    total_registrations = Registration.objects.filter(user=user).count()
+    if total_registrations > 2:
+        return {
+            "success": False,
+            "error": "MODE_SWITCH_LOCKED",
+            "currentMode": user.participation_days,
+            "requestedMode": target_days,
+            "totalRegistrations": total_registrations,
+        }
+
+    user.participation_days = target_days
+    user.participation_days_selected = True
+    user.save(update_fields=["participation_days", "participation_days_selected", "updated_at"])
+    return None
+
+
+def _get_or_create_user(name, phone, telegram_id, web_user_id=None, participation_days=None):
     normalized_telegram_id = _normalize_telegram_id(telegram_id)
+    normalized_web_user_id = _normalize_web_user_id(web_user_id)
+    normalized_participation_days = _parse_participation_days(participation_days)
 
     user = None
+    if normalized_web_user_id is not None:
+        user = TelegramUser.objects.filter(web_user_id=normalized_web_user_id).first()
+
     if normalized_telegram_id is not None:
-        user = TelegramUser.objects.filter(telegram_id=normalized_telegram_id).first()
+        user = user or TelegramUser.objects.filter(telegram_id=normalized_telegram_id).first()
 
     if not user and phone:
         user = TelegramUser.objects.filter(phone=phone).first()
@@ -321,16 +493,80 @@ def _get_or_create_user(name, phone, telegram_id):
         if normalized_telegram_id is not None and user.telegram_id != normalized_telegram_id:
             user.telegram_id = normalized_telegram_id
             updated = True
+        if normalized_web_user_id is not None and user.web_user_id is None:
+            user.web_user_id = normalized_web_user_id
+            updated = True
         if updated:
-            user.save(update_fields=["first_name", "phone", "telegram_id", "updated_at"])
+            user.save(
+                update_fields=[
+                    "first_name",
+                    "phone",
+                    "telegram_id",
+                    "web_user_id",
+                    "updated_at",
+                ]
+            )
         return user
 
     return TelegramUser.objects.create(
         telegram_id=normalized_telegram_id if normalized_telegram_id is not None else _generate_temp_telegram_id(),
+        web_user_id=normalized_web_user_id,
         username=None,
         first_name=name or "Гость",
         phone=phone or "",
+        participation_days=normalized_participation_days or 2,
+        participation_days_selected=normalized_participation_days in (1, 2),
     )
+
+
+@require_http_methods(["GET"])
+def bookings_profile(request):
+    web_user_id = _normalize_web_user_id(request.COOKIES.get(WEB_USER_COOKIE_NAME))
+    if web_user_id is None:
+        return JsonResponse(
+            {
+                "success": True,
+                "profile": {
+                    "hasPaidMode": False,
+                    "paidParticipationDays": 0,
+                    "participationDays": None,
+                    "name": "",
+                    "phone": "",
+                    "telegramId": "",
+                },
+            }
+        )
+
+    user = TelegramUser.objects.filter(web_user_id=web_user_id).first()
+    if not user:
+        return JsonResponse(
+            {
+                "success": True,
+                "profile": {
+                    "hasPaidMode": False,
+                    "paidParticipationDays": 0,
+                    "participationDays": None,
+                    "name": "",
+                    "phone": "",
+                    "telegramId": "",
+                },
+            }
+        )
+
+    response = JsonResponse(
+        {
+            "success": True,
+            "profile": {
+                "hasPaidMode": user.paid_participation_days in (1, 2),
+                "paidParticipationDays": user.paid_participation_days,
+                "participationDays": user.participation_days,
+                "name": user.first_name or "",
+                "phone": user.phone or "",
+                "telegramId": "" if user.telegram_id < 0 else str(user.telegram_id),
+            },
+        }
+    )
+    return _set_web_user_cookie(response, user)
 
 
 @csrf_exempt
@@ -373,8 +609,10 @@ def bookings_collection(request):
     name = form_data.get("name")
     phone = form_data.get("phone")
     telegram_id = form_data.get("telegramId") or form_data.get("telegram")
+    participation_days = form_data.get("participationDays")
     slot_id = form_data.get("slotId")
     seat_id = form_data.get("seatId")
+    cookie_web_user_id = _normalize_web_user_id(request.COOKIES.get(WEB_USER_COOKIE_NAME))
 
     if not all([master_name, game_title, seat_number, day, line, slot_id, seat_id]):
         return JsonResponse({"success": False, "error": "Missing required fields"}, status=400)
@@ -390,19 +628,37 @@ def bookings_collection(request):
     if Registration.objects.filter(slot_id=slot_id, seat_id=seat_id).exists():
         return JsonResponse({"success": False, "error": "Seat is already booked"}, status=400)
 
-    by_phone = 0
-    if _normalize_phone(phone):
-        by_phone = Registration.objects.filter(day=day, user__phone=phone).count()
+    user = _get_or_create_user(
+        name=name,
+        phone=phone,
+        telegram_id=telegram_id,
+        web_user_id=cookie_web_user_id,
+        participation_days=participation_days,
+    )
 
-    by_telegram_id = 0
-    normalized_telegram_id = _normalize_telegram_id(telegram_id)
-    if normalized_telegram_id is not None:
-        by_telegram_id = Registration.objects.filter(day=day, user__telegram_id=normalized_telegram_id).count()
+    if user.web_user_id is None:
+        user.web_user_id = uuid.uuid4()
+        user.save(update_fields=["web_user_id", "updated_at"])
 
-    if max(by_phone, by_telegram_id) >= 2:
-        return JsonResponse({"success": False, "error": "MAX_PER_DAY"}, status=400)
+    mode_error = _apply_participation_mode(user, participation_days)
+    if mode_error:
+        response = JsonResponse(mode_error, status=400)
+        return _set_web_user_cookie(response, user)
 
-    user = _get_or_create_user(name=name, phone=phone, telegram_id=telegram_id)
+    total_registrations = Registration.objects.filter(user=user).count()
+    allowed_games = _get_allowed_games_by_paid_mode(user)
+    if total_registrations >= allowed_games:
+        response = JsonResponse(
+            {
+                "success": False,
+                "error": "MODE_GAMES_LIMIT_REACHED",
+                "allowedGames": allowed_games,
+                "paidParticipationDays": user.paid_participation_days,
+                "currentMode": user.participation_days,
+            },
+            status=400,
+        )
+        return _set_web_user_cookie(response, user)
 
     booked_days = list(
         Registration.objects.filter(user=user)
@@ -410,7 +666,7 @@ def bookings_collection(request):
         .distinct()
     )
     if user.participation_days == 1 and booked_days and day not in booked_days:
-        return JsonResponse(
+        response = JsonResponse(
             {
                 "success": False,
                 "error": "ONE_DAY_MODE_DAY_LOCK",
@@ -418,14 +674,18 @@ def bookings_collection(request):
             },
             status=400,
         )
+        return _set_web_user_cookie(response, user)
 
     if Registration.objects.filter(user=user, day=day, line=line).exists():
-        return JsonResponse({"success": False, "error": "ALREADY_BOOKED_THIS_TIME"}, status=400)
+        response = JsonResponse({"success": False, "error": "ALREADY_BOOKED_THIS_TIME"}, status=400)
+        return _set_web_user_cookie(response, user)
 
     _assign_next_registration_number(user.id)
     time_start, time_end = _resolve_times_by_line(line)
 
     booking_id = _generate_booking_id()
+
+    auto_paid = user.paid_participation_days in (1, 2)
 
     registration = Registration.objects.create(
         user=user,
@@ -439,13 +699,30 @@ def bookings_collection(request):
         line=line,
         time_start=time_start,
         time_end=time_end,
+        is_paid=auto_paid,
         created_at=timezone.now(),
     )
 
     message = format_registration_message(registration, user, True)
-    send_to_telegram(message, registration.booking_id)
+    send_to_telegram(message, None if auto_paid else registration.booking_id)
+    _send_completion_message_if_reached(user)
 
-    return JsonResponse({"success": True, "bookingId": booking_id}, status=201)
+    response = JsonResponse(
+        {
+            "success": True,
+            "bookingId": booking_id,
+            "profile": {
+                "hasPaidMode": user.paid_participation_days in (1, 2),
+                "paidParticipationDays": user.paid_participation_days,
+                "participationDays": user.participation_days,
+                "name": user.first_name or "",
+                "phone": user.phone or "",
+                "telegramId": "" if user.telegram_id < 0 else str(user.telegram_id),
+            },
+        },
+        status=201,
+    )
+    return _set_web_user_cookie(response, user)
 
 
 @require_http_methods(["GET"])
@@ -456,6 +733,23 @@ def bookings_seats(request, slot_id):
         .values_list("seat_id", flat=True)
     )
     return JsonResponse({"success": True, "bookedSeats": seat_ids})
+
+
+@require_http_methods(["GET"])
+def bookings_seats_all(request):
+    rows = (
+        Registration.objects.exclude(slot_id__isnull=True)
+        .exclude(seat_id__isnull=True)
+        .values_list("slot_id", "seat_id")
+    )
+
+    grouped = {}
+    for slot_id, seat_id in rows:
+        if slot_id not in grouped:
+            grouped[slot_id] = []
+        grouped[slot_id].append(seat_id)
+
+    return JsonResponse({"success": True, "bookedSeats": grouped})
 
 
 @csrf_exempt

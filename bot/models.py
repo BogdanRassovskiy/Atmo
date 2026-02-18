@@ -3,6 +3,7 @@ from django.db import models
 
 class TelegramUser(models.Model):
     telegram_id = models.BigIntegerField(unique=True, db_index=True)
+    web_user_id = models.UUIDField(null=True, blank=True, unique=True, db_index=True)
     username = models.CharField(max_length=255, null=True, blank=True)
     first_name = models.CharField(max_length=255)
     last_name = models.CharField(max_length=255, null=True, blank=True)
@@ -17,6 +18,11 @@ class TelegramUser(models.Model):
     participation_days = models.PositiveSmallIntegerField(
         default=2,
         choices=((1, "1_day"), (2, "2_days")),
+    )
+    participation_days_selected = models.BooleanField(default=False)
+    paid_participation_days = models.PositiveSmallIntegerField(
+        default=0,
+        choices=((0, "not_paid"), (1, "1_day_paid"), (2, "2_days_paid")),
     )
     registration_number = models.BigIntegerField(null=True, blank=True, unique=True, db_index=True)
     # === Гибкие данные ===

@@ -75,7 +75,8 @@ def _resolve_user_registrations_sync(db_user_id, username):
     return {
         "user_id": user.id,
         "total": registrations.count(),
-        "unpaid": registrations.filter(is_paid=False).count(),
+        "paid_participation_days": user.paid_participation_days,
+        "participation_days": user.participation_days,
     }
 
 
@@ -88,7 +89,8 @@ def _set_participation_days_sync(telegram_id, days):
     if not user:
         return None
     user.participation_days = days
-    user.save(update_fields=["participation_days", "updated_at"])
+    user.participation_days_selected = True
+    user.save(update_fields=["participation_days", "participation_days_selected", "updated_at"])
     return user.participation_days
 
 
@@ -105,22 +107,23 @@ def _set_participation_days_with_rules_sync(telegram_id, target_days):
         return None
 
     previous_participation_days = user.participation_days
-    paid_count = Registration.objects.filter(user_id=user.id, is_paid=True).count()
+    registrations_count = Registration.objects.filter(user_id=user.id).count()
 
-    if target_days == 1 and paid_count > 2:
+    if target_days != previous_participation_days and registrations_count > 2:
         return {
             "success": False,
-            "error": "PAID_TOO_MANY_FOR_SWITCH",
-            "paid_count": paid_count,
+            "error": "MODE_SWITCH_LOCKED",
+            "registrations_count": registrations_count,
             "previous_participation_days": previous_participation_days,
             "participation_days": user.participation_days,
         }
 
     user.participation_days = target_days
-    user.save(update_fields=["participation_days", "updated_at"])
+    user.participation_days_selected = True
+    user.save(update_fields=["participation_days", "participation_days_selected", "updated_at"])
     return {
         "success": True,
-        "paid_count": paid_count,
+        "registrations_count": registrations_count,
         "previous_participation_days": previous_participation_days,
         "participation_days": user.participation_days,
     }
@@ -180,7 +183,7 @@ def _get_or_assign_registration_number_and_games_sync(user_id):
             user.registration_number = next_number
             user.save(update_fields=["registration_number", "updated_at"])
 
-        paid_regs = Registration.objects.filter(user_id=user.id, is_paid=True).order_by("day", "line", "created_at")
+        paid_regs = Registration.objects.filter(user_id=user.id).order_by("day", "line", "created_at")
         games_map = {}
         for reg in paid_regs:
             key = (reg.day, reg.line)
@@ -194,6 +197,32 @@ def _get_or_assign_registration_number_and_games_sync(user_id):
         }
 
 
+def _get_mode_payment_status_sync(user_id):
+    user = TelegramUser.objects.filter(id=user_id).first()
+    if not user:
+        return None
+
+    if user.paid_participation_days == 0:
+        return {
+            "need_payment": True,
+            "reason": "NO_MODE_PAYMENT",
+            "target_days": user.participation_days,
+        }
+
+    if user.paid_participation_days == 1 and user.participation_days == 2:
+        return {
+            "need_payment": True,
+            "reason": "UPGRADE_TO_TWO_DAYS",
+            "target_days": 2,
+        }
+
+    return {
+        "need_payment": False,
+        "reason": "MODE_ALREADY_PAID",
+        "target_days": user.paid_participation_days,
+    }
+
+
 @router.message(F.text.in_([MODE_TEXT_ONE_DAY, MODE_TEXT_TWO_DAYS]))
 async def participation_mode_text_handler(message: Message, db_user: TelegramUser):
     target_days = 1 if message.text == MODE_TEXT_ONE_DAY else 2
@@ -202,9 +231,9 @@ async def participation_mode_text_handler(message: Message, db_user: TelegramUse
         await message.answer("Пользователь не найден")
         return
 
-    if not update_result["success"] and update_result["error"] == "PAID_TOO_MANY_FOR_SWITCH":
+    if not update_result["success"] and update_result["error"] == "MODE_SWITCH_LOCKED":
         await message.answer(
-            "Нельзя переключиться на 1 день: у вас уже оплачено больше 2 игр.",
+            "Нельзя изменить вариант участия после регистрации более 2 игр.",
             reply_markup=_build_participation_mode_keyboard(update_result["participation_days"]),
         )
         return
@@ -217,16 +246,6 @@ async def participation_mode_text_handler(message: Message, db_user: TelegramUse
         reply_markup=_build_participation_mode_keyboard(current_days),
     )
 
-    if previous_days == 2 and current_days == 1 and update_result.get("paid_count") == 2:
-        completion_payload = await sync_to_async(_get_or_assign_registration_number_and_games_sync)(
-            db_user.id
-        )
-        completion_message = _build_completion_message(
-            registration_number=completion_payload["registration_number"],
-            participation_days=completion_payload["participation_days"],
-            games_map=completion_payload["games_map"],
-        )
-        await message.answer(completion_message)
 
 
 def _get_latest_unpaid_registration_ref_sync(user_id):
@@ -299,12 +318,22 @@ async def echo_handler(message: Message, db_user: TelegramUser):
         message.from_user.username,
     )
 
-    if user_info["unpaid"] > 0:
-        payment_text = (
-            "Для завершения регистрации необходимо внести 100% оплату участия.\n\n"
-            "Реквизиты для оплаты: 1234 5678 9012 3456\n\n"
-            "После оплаты отправьте скриншот в этот чат."
-        )
+    payment_status = await sync_to_async(_get_mode_payment_status_sync)(db_user.id)
+    if payment_status and payment_status["need_payment"]:
+        if payment_status["reason"] == "UPGRADE_TO_TWO_DAYS":
+            payment_text = (
+                "Для перехода на режим 2 дня необходимо доплатить до тарифа 600 000 сум.\n\n"
+                "Реквизиты для оплаты: 1234 5678 9012 3456\n\n"
+                "После оплаты отправьте скриншот в этот чат."
+            )
+        else:
+            amount = "450 000 сум" if payment_status["target_days"] == 1 else "600 000 сум"
+            payment_text = (
+                "Для завершения регистрации необходимо внести 100% оплату режима участия.\n\n"
+                f"Сумма: {amount}\n"
+                "Реквизиты для оплаты: 1234 5678 9012 3456\n\n"
+                "После оплаты отправьте скриншот в этот чат."
+            )
         await sync_to_async(_set_user_step_sync)(db_user.id, "awaiting_payment_screenshot")
         await message.answer(
             payment_text,
@@ -340,9 +369,9 @@ async def participation_mode_callback_handler(callback: CallbackQuery):
             await callback.answer("Пользователь не найден", show_alert=True)
             return
 
-        if not update_result["success"] and update_result["error"] == "PAID_TOO_MANY_FOR_SWITCH":
+        if not update_result["success"] and update_result["error"] == "MODE_SWITCH_LOCKED":
             await callback.answer(
-                "Нельзя переключиться на 1 день: уже оплачено больше 2 игр",
+                "Нельзя изменить вариант участия после регистрации более 2 игр",
                 show_alert=True,
             )
             return
@@ -355,18 +384,6 @@ async def participation_mode_callback_handler(callback: CallbackQuery):
         if callback.message:
             await callback.message.answer(mode_text)
 
-            if previous_days == 2 and current_days == 1 and update_result.get("paid_count") == 2:
-                db_user = await sync_to_async(TelegramUser.objects.filter(telegram_id=callback.from_user.id).first)()
-                if db_user:
-                    completion_payload = await sync_to_async(_get_or_assign_registration_number_and_games_sync)(
-                        db_user.id
-                    )
-                    completion_message = _build_completion_message(
-                        registration_number=completion_payload["registration_number"],
-                        participation_days=completion_payload["participation_days"],
-                        games_map=completion_payload["games_map"],
-                    )
-                    await callback.message.answer(completion_message)
 
         await callback.answer("Режим обновлен")
     except Exception as e:
@@ -429,14 +446,26 @@ async def payment_callback_handler(callback: CallbackQuery):
             except Registration.DoesNotExist:
                 return {"success": False, "error": "not_found"}
 
-        def get_paid_registrations_count_sync(user_id):
-            return Registration.objects.filter(user_id=user_id, is_paid=True).count()
+        def get_registrations_count_sync(user_id):
+            return Registration.objects.filter(user_id=user_id).count()
 
-        def get_required_paid_count_sync(user_id):
+        def get_required_count_sync(user_id):
             user = TelegramUser.objects.filter(id=user_id).first()
-            if user and user.participation_days == 1:
+            if user and user.paid_participation_days == 2:
+                return 4
+            if user and user.paid_participation_days == 1:
                 return 2
-            return 4
+            return 2
+
+        def set_paid_mode_sync(user_id):
+            user = TelegramUser.objects.filter(id=user_id).first()
+            if not user:
+                return 0
+            target_paid_mode = max(user.paid_participation_days, user.participation_days)
+            if target_paid_mode != user.paid_participation_days:
+                user.paid_participation_days = target_paid_mode
+                user.save(update_fields=["paid_participation_days", "updated_at"])
+            return user.paid_participation_days
         
         # Обновляем регистрацию
         result = await sync_to_async(update_registration_sync)(registration_ref, action)
@@ -452,6 +481,8 @@ async def payment_callback_handler(callback: CallbackQuery):
         if action == 'pay':
             status_text = "\n\n<b>✅ Статус: Оплачено</b>"
             print("Status set to: Paid")
+
+            paid_mode = await sync_to_async(set_paid_mode_sync)(result["user_id"])
             
             # Делаем запрос на внешний URL
             try:
@@ -488,28 +519,13 @@ async def payment_callback_handler(callback: CallbackQuery):
                     print(f"Failed to notify user about payment: {e}")
 
             if result.get("user_telegram_id") and not result.get("was_paid"):
-                paid_count = await sync_to_async(get_paid_registrations_count_sync)(
-                    result["user_id"]
-                )
-                required_paid_count = await sync_to_async(get_required_paid_count_sync)(
-                    result["user_id"]
-                )
-                if paid_count == required_paid_count:
-                    completion_payload = await sync_to_async(_get_or_assign_registration_number_and_games_sync)(
-                        result["user_id"]
+                try:
+                    await callback.bot.send_message(
+                        result["user_telegram_id"],
+                        f"✅ Оплата режима подтверждена ({'1 день' if paid_mode == 1 else '2 дня'}).",
                     )
-                    completion_message = _build_completion_message(
-                        registration_number=completion_payload["registration_number"],
-                        participation_days=completion_payload["participation_days"],
-                        games_map=completion_payload["games_map"],
-                    )
-                    try:
-                        await callback.bot.send_message(
-                            result["user_telegram_id"],
-                            completion_message,
-                        )
-                    except Exception as e:
-                        print(f"Failed to notify user about completed registrations: {e}")
+                except Exception as e:
+                    print(f"Failed to notify user about mode payment: {e}")
         else:  # cancel
             status_text = "\n\n<b>❌ Статус: Отменено (заявка удалена)</b>"
             print("Status set to: Cancelled")
